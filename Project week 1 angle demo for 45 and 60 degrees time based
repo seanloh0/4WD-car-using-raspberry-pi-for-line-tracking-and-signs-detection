@@ -1,0 +1,142 @@
+Python 3.13.9 (tags/v3.13.9:8183fa5, Oct 14 2025, 14:09:13) [MSC v.1944 64 bit (AMD64)] on win32
+Enter "help" below or click "Help" above for more information.
+import RPi.GPIO as GPIO
+import time
+
+# -------------------------
+# Pin definitions (your pins)
+# -------------------------
+
+# Motor A (Left motor)
+ENA = 18
+IN1 = 17
+IN2 = 22
+
+# Motor B (Right motor)
+ENB = 13
+IN3 = 23
+IN4 = 24
+
+# -------------------------
+# Turning calibration
+# -------------------------
+# Start with a guess, then tune.
+# Example tuning:
+# - If command 90 degrees but it turns only ~60, DECREASE this value? Actually it turned less => needs MORE time => INCREASE.
+# - If it turns too much, DECREASE.
+SECONDS_PER_DEGREE = 0.0044  # <-- tune this!
+
+# PWM frequency
+PWM_FREQ = 1000
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+
+pwmA = GPIO.PWM(ENA, PWM_FREQ)
+pwmB = GPIO.PWM(ENB, PWM_FREQ)
+pwmA.start(0)
+pwmB.start(0)
+
+def set_left_motor(direction: int):
+    """direction: 1 forward, -1 backward, 0 stop"""
+    if direction == 1:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+    elif direction == -1:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+    else:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.LOW)
+
+def set_right_motor(direction: int):
+    """direction: 1 forward, -1 backward, 0 stop"""
+    if direction == 1:
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+    elif direction == -1:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+    else:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.LOW)
+
+def stop():
+    set_left_motor(0)
+    set_right_motor(0)
+    pwmA.ChangeDutyCycle(0)
+    pwmB.ChangeDutyCycle(0)
+
+def turn_in_place(degrees: float, speed: float = 60.0):
+    """
+    Turn on the spot (in-place).
+    degrees > 0 : turn right
+    degrees < 0 : turn left
+    speed: PWM duty (0-100)
+    """
+    if degrees == 0:
+        return
+
+    # Clamp speed safely
+    speed = max(0.0, min(100.0, speed))
+
+    # Time needed for requested angle
+    duration = abs(degrees) * SECONDS_PER_DEGREE
+
+    # Right turn: left wheel forward, right wheel backward
+    if degrees > 0:
+        set_left_motor(1)
+        set_right_motor(-1)
+    # Left turn: left wheel backward, right wheel forward
+    else:
+        set_left_motor(-1)
+        set_right_motor(1)
+
+    pwmA.ChangeDutyCycle(speed)
+    pwmB.ChangeDutyCycle(speed)
+
+    time.sleep(duration)
+    stop()
+
+def turn_angle(degrees: float, speed: float = 60.0):
+...     """Alias to keep your intent clear."""
+...     turn_in_place(degrees, speed)
+... 
+... # -------------------------
+... # Manual input loop
+... # -------------------------
+... try:
+...     print("Type an angle to turn (e.g. 30, -90). Type 'q' to quit.")
+...     print(f"Current SECONDS_PER_DEGREE = {SECONDS_PER_DEGREE}")
+...     while True:
+...         user = input("Angle (deg): ").strip().lower()
+...         if user in ("q", "quit", "exit"):
+...             break
+... 
+...         # Optional: allow quick calibration change, e.g. "k 0.012"
+...         if user.startswith("k "):
+...             try:
+...                 new_k = float(user.split()[1])
+...                 globals()["SECONDS_PER_DEGREE"] = new_k
+...                 print(f"Updated SECONDS_PER_DEGREE = {SECONDS_PER_DEGREE}")
+...             except Exception:
+...                 print("Usage: k 0.012")
+...             continue
+... 
+...         try:
+...             deg = float(user)
+...         except ValueError:
+...             print("Please enter a number like 45 or -90, or 'q' to quit.")
+...             continue
+... 
+...         # Change speed here if you want, or ask for it from input
+...         turn_angle(deg, speed=60.0)
+...         print(f"Turned {deg} degrees.")
+... finally:
+...     stop()
+...     pwmA.stop()
+...     pwmB.stop()
+...     GPIO.cleanup()
+... 
