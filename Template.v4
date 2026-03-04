@@ -1,0 +1,216 @@
+import os
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+import time
+
+os.environ["DISPLAY"] = ":0"
+
+# ===============================
+# GPIO MOTOR SETUP
+# ===============================
+
+ENA = 18
+IN1 = 17
+IN2 = 22
+IN3 = 23
+IN4 = 24
+ENB = 13
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+GPIO.setup([ENA, IN1, IN2, IN3, IN4, ENB], GPIO.OUT)
+
+pwmA = GPIO.PWM(ENA,1000)
+pwmB = GPIO.PWM(ENB,1000)
+
+pwmA.start(65)
+pwmB.start(65)
+
+# ===============================
+# MOTOR FUNCTIONS
+# ===============================
+
+def stop():
+    GPIO.output([IN1,IN2,IN3,IN4],GPIO.LOW)
+
+def forward():
+    GPIO.output(IN1,GPIO.LOW)
+    GPIO.output(IN2,GPIO.HIGH)
+    GPIO.output(IN3,GPIO.LOW)
+    GPIO.output(IN4,GPIO.HIGH)
+
+def left():
+    GPIO.output(IN1,GPIO.LOW)
+    GPIO.output(IN2,GPIO.HIGH)
+    GPIO.output(IN3,GPIO.HIGH)
+    GPIO.output(IN4,GPIO.LOW)
+
+def right():
+    GPIO.output(IN1,GPIO.HIGH)
+    GPIO.output(IN2,GPIO.LOW)
+    GPIO.output(IN3,GPIO.LOW)
+    GPIO.output(IN4,GPIO.HIGH)
+
+def backward():
+    GPIO.output(IN1,GPIO.HIGH)
+    GPIO.output(IN2,GPIO.LOW)
+    GPIO.output(IN3,GPIO.HIGH)
+    GPIO.output(IN4,GPIO.LOW)
+
+# ===============================
+# ARROW DETECTION
+# ===============================
+
+def detect_arrow_direction(frame):
+
+    hsv = cv2.cvtColor(frame,cv2.COLOR_BGR2HSV)
+
+    lower_red1 = np.array([0,120,70])
+    upper_red1 = np.array([10,255,255])
+
+    lower_red2 = np.array([170,120,70])
+    upper_red2 = np.array([180,255,255])
+
+    mask1 = cv2.inRange(hsv,lower_red1,upper_red1)
+    mask2 = cv2.inRange(hsv,lower_red2,upper_red2)
+
+    mask = mask1 + mask2
+
+    kernel = np.ones((5,5),np.uint8)
+    mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kernel)
+
+    contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) == 0:
+        return None
+
+    cnt = max(contours,key=cv2.contourArea)
+
+    if cv2.contourArea(cnt) < 2000:
+        return None
+
+    x,y,w,h = cv2.boundingRect(cnt)
+
+    roi = mask[y:y+h,x:x+w]
+
+    h_mid = h//2
+    w_mid = w//2
+
+    left = cv2.countNonZero(roi[:, :w_mid])
+    right = cv2.countNonZero(roi[:, w_mid:])
+    top = cv2.countNonZero(roi[:h_mid, :])
+    bottom = cv2.countNonZero(roi[h_mid:, :])
+
+    horizontal = abs(left-right)
+    vertical = abs(top-bottom)
+
+    if horizontal > vertical:
+
+        if right > left:
+            return "RIGHT"
+        else:
+            return "LEFT"
+
+    else:
+
+        if top > bottom:
+            return "FORWARD"
+        else:
+            return "BACKWARD"
+
+# ===============================
+# CAMERA
+# ===============================
+
+picam2 = Picamera2()
+
+picam2.configure(
+picam2.create_preview_configuration(
+main={"format":"XRGB8888","size":(640,480)}
+)
+)
+
+picam2.start()
+time.sleep(2)
+
+print("Robot Vision Started")
+
+# ===============================
+# STABILITY FILTER
+# ===============================
+
+stable_dir=None
+stable_count=0
+
+STABLE_FRAME_REQUIRED=8
+COOLDOWN=1.0
+
+last_action_time=time.time()
+
+# ===============================
+# MAIN LOOP
+# ===============================
+
+try:
+
+    while True:
+
+        frame=picam2.capture_array()
+
+        detected=detect_arrow_direction(frame)
+
+        if detected==stable_dir:
+            stable_count+=1
+        else:
+            stable_dir=detected
+            stable_count=1
+
+        if stable_dir is not None and \
+           stable_count>=STABLE_FRAME_REQUIRED and \
+           time.time()-last_action_time>COOLDOWN:
+
+            print("Direction:",stable_dir)
+
+            stop()
+
+            if stable_dir=="FORWARD":
+                forward()
+
+            elif stable_dir=="LEFT":
+                left()
+
+            elif stable_dir=="RIGHT":
+                right()
+
+            elif stable_dir=="BACKWARD":
+                backward()
+
+            last_action_time=time.time()
+
+        elif stable_dir is None:
+            stop()
+
+        if detected is not None:
+            cv2.putText(frame,detected,(30,60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.5,(0,255,0),3)
+
+        cv2.imshow("Robot Camera",frame)
+
+        if cv2.waitKey(1)&0xFF==ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("Stopped")
+
+finally:
+
+    stop()
+    pwmA.stop()
+    pwmB.stop()
+    GPIO.cleanup()
+    picam2.stop()
+    cv2.destroyAllWindows()
