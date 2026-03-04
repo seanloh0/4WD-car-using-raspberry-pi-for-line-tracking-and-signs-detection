@@ -1,0 +1,33 @@
+from picamera2 import Picamera2
+import cv2
+import time
+
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(
+    main={"format": 'XRGB8888', "size": (640, 480)}
+))
+picam2.start()
+
+time.sleep(2)
+
+print("Press 's' to save, 'q' to quit")
+
+count = 0
+
+while True:
+    frame = picam2.capture_array()
+    cv2.imshow("Camera", frame)
+
+    key = cv2.waitKey(1)
+
+    if key == ord('s'):
+        filename = f"symbol_{count}.jpg"
+        cv2.imwrite(filename, frame)
+        print(filename, "saved")
+        count += 1
+
+    elif key == ord('q'):
+        break
+
+cv2.destroyAllWindows()
+picam2.stop()
