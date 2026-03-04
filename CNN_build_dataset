@@ -1,0 +1,79 @@
+import cv2
+import os
+import numpy as np
+import random
+
+# source folders
+SHAPE_FOLDER = "/home/pi/Desktop/shape"
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+ARROW_FOLDER = "/home/pi/Desktop/arrow_direction"
+
+DATASET = "dataset"
+
+IMG_SIZE = 64
+AUGMENT = 200
+
+os.makedirs(DATASET, exist_ok=True)
+
+
+def augment_image(img):
+
+    h,w = img.shape[:2]
+
+    angle = random.randint(-40,40)
+    M = cv2.getRotationMatrix2D((w/2,h/2),angle,1)
+    img = cv2.warpAffine(img,M,(w,h))
+
+    scale = random.uniform(0.7,1.3)
+    img = cv2.resize(img,(0,0),fx=scale,fy=scale)
+
+    img = cv2.resize(img,(IMG_SIZE,IMG_SIZE))
+
+    noise = np.random.normal(0,8,img.shape)
+    img = img + noise
+    img = np.clip(img,0,255)
+
+    return img.astype(np.uint8)
+
+
+def process_folder(folder,prefix=""):
+
+    for file in os.listdir(folder):
+
+        if not file.endswith(".png"):
+            continue
+
+        name = file.split(".")[0]
+
+        if " " in name:
+            name = name.replace(" ","")
+
+        label = prefix + name
+
+        save_dir = os.path.join(DATASET,label)
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        path = os.path.join(folder,file)
+
+        img = cv2.imread(path)
+
+        if img is None:
+            continue
+
+        for i in range(AUGMENT):
+
+            aug = augment_image(img)
+
+            save_path = os.path.join(save_dir,f"{i}.png")
+
+            cv2.imwrite(save_path,aug)
+
+
+print("Building dataset...")
+
+process_folder(SHAPE_FOLDER)
+process_folder(SYMBOL_FOLDER)
+process_folder(ARROW_FOLDER,"arrow_")
+
+print("Dataset creation complete")
