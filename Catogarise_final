@@ -1,0 +1,250 @@
+import cv2
+import numpy as np
+import os
+import time
+from picamera2 import Picamera2
+ 
+# =========================
+# CAMERA SETUP
+# =========================
+ 
+picam2 = Picamera2()
+ 
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"format": "XRGB8888", "size": (640, 480)}
+    )
+)
+ 
+picam2.start()
+time.sleep(2)
+ 
+# =========================
+# FEATURE DETECTOR
+# =========================
+ 
+orb = cv2.ORB_create(nfeatures=1200)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+ 
+# =========================
+# LOAD SYMBOL TEMPLATES
+# =========================
+ 
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+ 
+symbol_templates = []
+ 
+for file in os.listdir(SYMBOL_FOLDER):
+ 
+    if not file.endswith(".png"):
+        continue
+ 
+    path = os.path.join(SYMBOL_FOLDER, file)
+ 
+    img = cv2.imread(path, 0)
+ 
+    if img is None:
+        continue
+ 
+    _, des = orb.detectAndCompute(img, None)
+ 
+    if des is not None:
+        symbol_templates.append(des)
+ 
+print("Symbol templates loaded:", len(symbol_templates))
+ 
+# =========================
+# LOAD SHAPE TEMPLATES
+# =========================
+ 
+SHAPE_FOLDER = "/home/pi/Desktop/shape"
+ 
+shape_templates = []
+ 
+for file in os.listdir(SHAPE_FOLDER):
+ 
+    if not file.endswith(".png"):
+        continue
+ 
+    path = os.path.join(SHAPE_FOLDER, file)
+ 
+    img = cv2.imread(path)
+ 
+    if img is None:
+        continue
+ 
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+ 
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        21,
+        5
+    )
+ 
+    kernel = np.ones((3,3),np.uint8)
+    thresh = cv2.dilate(thresh,kernel,iterations=1)
+ 
+    contours,_ = cv2.findContours(
+        thresh,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+ 
+    if contours:
+        shape_templates.append(max(contours, key=cv2.contourArea))
+ 
+print("Shape templates loaded:", len(shape_templates))
+ 
+# =========================
+# ARROW DETECTION
+# =========================
+ 
+def detect_arrow(frame):
+ 
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+ 
+    mask = cv2.inRange(
+        hsv,
+        np.array([0,50,50]),
+        np.array([180,255,255])
+    )
+ 
+    kernel = np.ones((5,5),np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+ 
+    contours,_ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+ 
+    for cnt in contours:
+ 
+        if cv2.contourArea(cnt) < 5000:
+            continue
+ 
+        return True
+ 
+    return False
+ 
+# =========================
+# SYMBOL DETECTION
+# =========================
+ 
+def detect_symbol(gray):
+ 
+    kp, des = orb.detectAndCompute(gray, None)
+ 
+    if des is None:
+        return False
+ 
+    for template in symbol_templates:
+ 
+        matches = bf.knnMatch(template, des, k=2)
+ 
+        good = 0
+ 
+        for pair in matches:
+ 
+            if len(pair) < 2:
+                continue
+ 
+            m, n = pair
+ 
+            if m.distance < 0.75 * n.distance:
+                good += 1
+ 
+        score = good / len(template)
+ 
+        if score > 0.08:
+            return True
+ 
+    return False
+ 
+# =========================
+# SHAPE DETECTION
+# =========================
+ 
+def detect_shape(gray):
+ 
+    blur = cv2.GaussianBlur(gray,(5,5),0)
+ 
+    thresh = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        21,
+        5
+    )
+ 
+    kernel = np.ones((3,3),np.uint8)
+    thresh = cv2.dilate(thresh,kernel,iterations=1)
+ 
+    contours,_ = cv2.findContours(
+        thresh,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+ 
+    for c in contours:
+ 
+        if cv2.contourArea(c) < 800:
+            continue
+ 
+        for temp in shape_templates:
+ 
+            score = cv2.matchShapes(c,temp,1,0)
+ 
+            if score < 0.25:
+                return True
+ 
+    return False
+ 
+# =========================
+# MAIN LOOP
+# =========================
+ 
+print("Vision Category System Running...")
+ 
+while True:
+ 
+    frame = picam2.capture_array()
+ 
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+ 
+    category = "DETECTING"
+ 
+    # Better detection priority
+ 
+    if detect_symbol(gray):
+        category = "SYMBOL"
+ 
+    elif detect_shape(gray):
+        category = "SHAPE"
+ 
+    elif detect_arrow(frame):
+        category = "ARROW"
+ 
+    print(category)
+ 
+    cv2.putText(
+        frame,
+        category,
+        (30,60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0,255,0),
+        3
+    )
+ 
+    cv2.imshow("Vision System", frame)
+ 
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+ 
+picam2.stop()
+cv2.destroyAllWindows()
