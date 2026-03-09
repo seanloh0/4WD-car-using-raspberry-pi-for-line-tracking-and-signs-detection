@@ -1,0 +1,334 @@
+import time
+import cv2
+import numpy as np
+ 
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+ 
+# ============================================================
+# PIN CONNECTIONS
+# ============================================================
+ 
+# Servo (steering)
+SERVO_GPIO = 12  # BCM 12
+ 
+# Motor A (Left motor)
+ENA = 18   # PWM
+IN1 = 17
+IN2 = 22
+ 
+# Motor B (Right motor)
+ENB = 13   # PWM
+IN3 = 23
+IN4 = 24
+ 
+# ============================================================
+# GPIO SETUP
+# ============================================================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+ 
+GPIO.setup(SERVO_GPIO, GPIO.OUT)
+GPIO.setup([IN1, IN2, IN3, IN4], GPIO.OUT)
+GPIO.setup([ENA, ENB], GPIO.OUT)
+ 
+# PWM
+servo_pwm = GPIO.PWM(SERVO_GPIO, 50)   # 50Hz servo
+pwmA = GPIO.PWM(ENA, 1000)             # 1000Hz motor PWM
+pwmB = GPIO.PWM(ENB, 1000)
+ 
+servo_pwm.start(7.5)
+pwmA.start(0)
+pwmB.start(0)
+ 
+# ============================================================
+# HELPERS
+# ============================================================
+def angle_to_duty(angle):
+    return 2.5 + (angle / 180.0) * 10.0
+ 
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+ 
+# ============================================================
+# SERVO SETTINGS
+# ============================================================
+MIN_ANGLE = 0
+MAX_ANGLE = 180
+CENTER_ANGLE = 120
+ 
+servo_angle = CENTER_ANGLE
+servo_pwm.ChangeDutyCycle(angle_to_duty(servo_angle))
+time.sleep(0.1)
+ 
+# ============================================================
+# MOTOR HELPERS (L298N)
+# ============================================================
+def set_motor(left, right):
+    """
+    left/right: -100..100
+    + = forward, - = reverse
+    """
+    left = int(clamp(left, -100, 100))
+    right = int(clamp(right, -100, 100))
+ 
+    # Left motor
+    if left >= 0:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+        pwmA.ChangeDutyCycle(left)
+    else:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        pwmA.ChangeDutyCycle(-left)
+ 
+    # Right motor
+    if right >= 0:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+        pwmB.ChangeDutyCycle(right)
+    else:
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+        pwmB.ChangeDutyCycle(-right)
+ 
+def stop_all():
+    set_motor(0, 0)
+    servo_pwm.ChangeDutyCycle(angle_to_duty(CENTER_ANGLE))
+    
+# ============================================================
+# PID CONTROLLER (STEERING)
+# ============================================================
+class PID:
+    """
+    PID on error (setpoint=0), with:
+      - dt handling
+      - integral clamp (anti-windup)
+      - derivative on measurement via d(error)/dt (good enough here)
+    Output units here are "degrees of steering offset".
+    """
+    def __init__(self, kp, ki, kd, output_limits=(-60.0, 60.0), integral_limits=(-0.6, 0.6)):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.min_out, self.max_out = output_limits
+        self.min_i, self.max_i = integral_limits
+ 
+        self.integral = 0.0
+        self.prev_error = None
+        self.prev_t = None
+ 
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = None
+        self.prev_t = None
+ 
+    def update(self, error, now=None):
+        if now is None:
+            now = time.time()
+ 
+        if self.prev_t is None:
+            self.prev_t = now
+            self.prev_error = error
+            return 0.0
+ 
+        dt = now - self.prev_t
+        if dt <= 1e-6:
+            return 0.0
+ 
+        # Integral with clamp
+        self.integral += error * dt
+        self.integral = max(self.min_i, min(self.integral, self.max_i))
+ 
+        # Derivative
+        d_error = (error - self.prev_error) / dt
+ 
+        out = (self.kp * error) + (self.ki * self.integral) + (self.kd * d_error)
+        out = max(self.min_out, min(out, self.max_out))
+ 
+        self.prev_t = now
+        self.prev_error = error
+        return out
+ 
+# CAMERA SETUP (Picamera2)
+# ============================================================
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"}
+)
+picam2.configure(config)
+picam2.start()
+time.sleep(2)
+
+# ============================================================
+# LINE DETECTION SETTINGS
+# ============================================================
+BLACK_THRESHOLD = 70      # adjust 50..100 depending on lighting
+MIN_BLACK_AREA = 800     # adjust to avoid false loss
+ 
+# ROI: for curvy tracks, look slightly higher to "see" the curve earlier
+ROI_TOP_FRAC = 0.55       # 0.50..0.65 (higher = earlier look, but can miss close line)
+ 
+# ============================================================
+# CONTROL SETTINGS
+# ============================================================
+ 
+# Servo smoothing (keeps motion stable on S-curves)
+SERVO_SMOOTH = 0.20      # 0..1 (higher = faster, lower = smoother)
+ 
+# PID gains (good starting point for your curvy track)
+PID_KP = 38.0 #50
+PID_KI = 0.0              # keep 0 first; add small KI later only if steady drift
+PID_KD = 35.0
+ 
+# PID output -> degrees offset from CENTER_ANGLE (clamped inside PID)
+pid = PID(PID_KP, PID_KI, PID_KD, output_limits=(-60.0, 60.0), integral_limits=(-0.6, 0.6))
+ 
+# Drive
+BASE_SPEED = 39 #38  #40      # forward speed on straights
+MAX_DIFF = 30             # max left/right difference due to steering
+WHEEL_FOLLOW_GAIN = 1.4   # 0.6..1.4
+ 
+# Auto slow down on sharp turns (important for S-bends)
+TURN_SLOWDOWN = 0.7      # 0..0.8 fraction to reduce speed at full steering
+MIN_SPEED = 18
+ 
+# Search mode
+SEARCH_SPIN_SPEED= 14
+last_direction = 4.5     # +1 spin right, -1 spin left
+ 
+# If your steering direction is reversed, set this True
+REVERSE_STEERING = False  # set True if it turns the wrong way
+ 
+def detect_black_line(frame_rgb):
+    """
+    Returns:
+      found(bool), error(-1..+1), mask(ROI mask), cx_in_roi(int or None), roi_y0(int)
+    """
+    h, w = frame_rgb.shape[:2]
+ 
+    y0 = int(h * ROI_TOP_FRAC)
+    roi = frame_rgb[y0:h, :]
+ 
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+ 
+    _, mask = cv2.threshold(gray, BLACK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+ 
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+ 
+    black_area = cv2.countNonZero(mask)
+    if black_area < MIN_BLACK_AREA:
+        return False, 0.0, mask, None, y0
+    #####################################################
+    if black_area == False:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+    #####################################################
+    M = cv2.moments(mask)
+    if M["m00"] == 0:
+        return False, 0.0, mask, None, y0
+ 
+    cx = int(M["m10"] / M["m00"])  # cx inside ROI coords (same width as full frame)
+    error = (cx - (w / 2)) / (w / 2)
+    error = float(clamp(error, -1.0, 1.0))
+    return True, error, mask, cx, y0
+
+# MAIN LOOP
+# ============================================================
+try:
+    while True:
+        frame = picam2.capture_array()  # RGB888
+        found, error, mask, cx, y0 = detect_black_line(frame)
+ 
+        h, w = frame.shape[:2]
+ 
+        # Debug overlay
+        cv2.rectangle(frame, (0, y0), (w - 1, h - 1), (0, 255, 0), 2)
+        cv2.line(frame, (w // 2, y0), (w // 2, h), (255, 255, 0), 2)
+ 
+        if found:
+            now = time.time()
+ 
+            # If steering is reversed for your hardware
+            steer_error = -error if REVERSE_STEERING else error
+ 
+            # ------------------------------------------------
+            # 1) PID -> steering offset (degrees)
+            # ------------------------------------------------
+            steer_deg = pid.update(steer_error, now=now)   # degrees offset
+            target = CENTER_ANGLE + steer_deg
+            target = clamp(target, MIN_ANGLE, MAX_ANGLE)
+ 
+            # Smooth servo movement
+            servo_angle = servo_angle + SERVO_SMOOTH * (target - servo_angle)
+            servo_pwm.ChangeDutyCycle(angle_to_duty(servo_angle))
+ 
+            # Remember last direction for searching
+            if error > 0.05:
+                last_direction = 7
+            elif error < -0.05:
+                last_direction = -10
+ 
+            # ------------------------------------------------
+            # 2) Wheels follow the servo (differential drive)
+            # + Auto slowdown on sharp turns
+            # ------------------------------------------------
+            servo_norm = (servo_angle - CENTER_ANGLE) / (MAX_ANGLE - CENTER_ANGLE)
+            servo_norm = float(clamp(servo_norm, -1.0, 1.0))
+ 
+            turn_strength = abs(servo_norm)  # 0..1
+            speed = BASE_SPEED * (1.0 - TURN_SLOWDOWN * turn_strength)
+            speed = int(max(MIN_SPEED, speed))
+ 
+            delta = int(WHEEL_FOLLOW_GAIN * servo_norm * MAX_DIFF)
+ 
+            left_speed = speed - delta
+            right_speed = speed + delta
+            set_motor(left_speed, right_speed)
+ 
+            # Extra debug
+            if cx is not None:
+                cv2.circle(frame, (int(cx), int((y0 + h) / 2)), 6, (0, 255, 0), -1)
+ 
+            cv2.putText(frame,
+                        f"FOUND err={error:+.2f} pidDeg={steer_deg:+.1f} servo={servo_angle:.1f} spd={speed}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+ 
+        else:
+            # LOST LINE -> SEARCH SPIN
+            set_motor(-SEARCH_SPIN_SPEED * last_direction,
+                      +SEARCH_SPIN_SPEED * last_direction)
+ 
+            # Keep steering near center
+            servo_angle = servo_angle + SERVO_SMOOTH * (CENTER_ANGLE - servo_angle)
+            servo_pwm.ChangeDutyCycle(angle_to_duty(servo_angle))
+ 
+            # Important: prevent integral windup when line is lost
+            pid.reset()
+ 
+            cv2.putText(frame, "LOST -> SEARCHING",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+ 
+        cv2.imshow("Camera", frame)
+        cv2.imshow("Mask(ROI)", mask)
+ 
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+ 
+        time.sleep(0.03)
+ 
+except KeyboardInterrupt:
+    pass
+ 
+finally:
+    stop_all()
+    pwmA.stop()
+    pwmB.stop()
+    servo_pwm.stop()
+    GPIO.cleanup()
+    cv2.destroyAllWindows()

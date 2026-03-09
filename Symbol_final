@@ -1,0 +1,120 @@
+import cv2
+import os
+from picamera2 import Picamera2
+import time
+
+# =============================
+# TEMPLATE FOLDER (SYMBOL ONLY)
+# =============================
+
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+
+# =============================
+# ORB FEATURE DETECTOR
+# =============================
+
+orb = cv2.ORB_create(nfeatures=1000)
+
+templates = []
+labels = []
+
+def load_templates(folder):
+
+    for file in os.listdir(folder):
+
+        if not file.endswith(".png"):
+            continue
+
+        path = os.path.join(folder, file)
+
+        img = cv2.imread(path, 0)
+
+        if img is None:
+            continue
+
+        kp, des = orb.detectAndCompute(img, None)
+
+        if des is None:
+            continue
+
+        label = file.split(".")[0]
+
+        templates.append(des)
+        labels.append(label)
+
+# Load symbol templates only
+load_templates(SYMBOL_FOLDER)
+
+print("Loaded symbol templates:", len(labels))
+
+# =============================
+# MATCHER
+# =============================
+
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+# =============================
+# CAMERA
+# =============================
+
+picam2 = Picamera2()
+
+picam2.configure(
+    picam2.create_preview_configuration(
+        main={"format": "XRGB8888", "size": (640, 480)}
+    )
+)
+
+picam2.start()
+
+time.sleep(2)
+
+print("Symbol vision system started")
+
+# =============================
+# MAIN LOOP
+# =============================
+
+while True:
+
+    frame = picam2.capture_array()
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    kp, des = orb.detectAndCompute(gray, None)
+
+    if des is None:
+        continue
+
+    best_label = None
+    best_score = 0
+
+    for i, temp in enumerate(templates):
+
+        matches = bf.match(temp, des)
+
+        score = len(matches)
+
+        if score > best_score:
+            best_score = score
+            best_label = labels[i]
+
+    if best_score > 20:
+
+        cv2.putText(
+            frame,
+            best_label,
+            (30, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.5,
+            (0, 255, 0),
+            3
+        )
+
+    cv2.imshow("Symbol Detection", frame)
+
+    if cv2.waitKey(1) == ord('q'):
+        break
+
+picam2.stop()
+cv2.destroyAllWindows()
