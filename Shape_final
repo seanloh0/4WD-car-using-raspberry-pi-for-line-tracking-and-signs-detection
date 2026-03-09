@@ -1,0 +1,164 @@
+import cv2
+import numpy as np
+import os
+from picamera2 import Picamera2
+
+# ==============================
+# Camera Setup
+# ==============================
+
+camera = Picamera2()
+camera.preview_configuration.main.size = (320,240)
+camera.preview_configuration.main.format = "RGB888"
+camera.configure("preview")
+camera.start()
+
+# ==============================
+# Template Folder
+# ==============================
+
+TEMPLATE_FOLDER = "/home/pi/Desktop/shape"
+
+templates = {}
+
+# ==============================
+# Normalize Template Names
+# ==============================
+
+def normalize_name(filename):
+
+    name = filename.split(".")[0].lower()
+
+    # remove numbers like .1 .2 .3 .4
+    name = name.replace("1","")
+    name = name.replace("2","")
+    name = name.replace("3","")
+    name = name.replace("4","")
+
+    name = name.replace("_","")
+
+    return name
+
+# ==============================
+# Load Templates
+# ==============================
+
+for file in os.listdir(TEMPLATE_FOLDER):
+
+    if not file.endswith(".png"):
+        continue
+
+    path = os.path.join(TEMPLATE_FOLDER,file)
+
+    img = cv2.imread(path)
+
+    if img is None:
+        continue
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    _, thresh = cv2.threshold(gray,120,255,cv2.THRESH_BINARY_INV)
+
+    contours,_ = cv2.findContours(thresh,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) == 0:
+        continue
+
+    largest = max(contours,key=cv2.contourArea)
+
+    name = normalize_name(file)
+
+    if name not in templates:
+        templates[name] = []
+
+    templates[name].append(largest)
+
+print("Loaded templates:")
+print(templates.keys())
+
+# ==============================
+# Shape Matching
+# ==============================
+
+def match_shape(contour):
+
+    best_name = None
+    best_score = 999
+
+    for name,template_list in templates.items():
+
+        for template in template_list:
+
+            score = cv2.matchShapes(contour,template,1,0)
+
+            if score < best_score:
+                best_score = score
+                best_name = name
+
+    if best_score < 0.25:
+        return best_name
+
+    return None
+
+# ==============================
+# Shape Detection
+# ==============================
+
+def detect_shapes(frame):
+
+    gray = cv2.cvtColor(frame,cv2.COLOR_RGB2GRAY)
+
+    blur = cv2.GaussianBlur(gray,(5,5),0)
+
+    _,thresh = cv2.threshold(blur,110,255,cv2.THRESH_BINARY_INV)
+
+    contours,_ = cv2.findContours(thresh,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+
+    contour_view = frame.copy()
+
+    for contour in contours:
+
+        if cv2.contourArea(contour) < 1200:
+            continue
+
+        contour = cv2.approxPolyDP(contour,0.01*cv2.arcLength(contour,True),True)
+
+        shape_name = match_shape(contour)
+
+        x,y,w,h = cv2.boundingRect(contour)
+
+        if shape_name:
+
+            cv2.rectangle(frame,(x,y),(x+w,y+h),(0,255,0),2)
+
+            cv2.putText(frame,
+                        shape_name,
+                        (x,y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0,255,0),
+                        2)
+
+            print("Detected:",shape_name)
+
+        cv2.drawContours(contour_view,[contour],-1,(0,255,0),2)
+
+    cv2.imshow("Camera View",frame)
+    cv2.imshow("Black White",thresh)
+    cv2.imshow("Contours",contour_view)
+
+# ==============================
+# Main Loop
+# ==============================
+
+while True:
+
+    frame = camera.capture_array()
+
+    detect_shapes(frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cv2.destroyAllWindows()
+camera.stop()
