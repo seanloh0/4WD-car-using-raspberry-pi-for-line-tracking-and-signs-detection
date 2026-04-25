@@ -1,0 +1,311 @@
+import time
+import cv2
+import numpy as np
+import os
+import threading
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+
+# ============================================================
+# GPIO SETUP
+# ============================================================
+ENA, IN1, IN2 = 18, 17, 22
+ENB, IN3, IN4 = 13, 23, 24
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+
+pwmA = GPIO.PWM(ENA, 1000)
+pwmB = GPIO.PWM(ENB, 1000)
+pwmA.start(0)
+pwmB.start(0)
+
+BASE_SPEED = 38
+TURN_SPEED = 45
+TURN_TIME = 0.7
+
+# ============================================================
+# SHARED STATE
+# ============================================================
+class SharedState:
+    def __init__(self):
+        self.frame = None
+        self.running = True
+        self.mode = "FOLLOWING"
+        self.last_label = "None"
+        self.lock = threading.Lock()
+
+        self.cooldown = 0
+
+    def set_frame(self, frame):
+        with self.lock:
+            self.frame = frame
+
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+state = SharedState()
+
+# ============================================================
+# COLOR PRIORITY (RED / YELLOW)
+# ============================================================
+def detect_priority_color(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    red1 = cv2.inRange(hsv, (0,120,70), (10,255,255))
+    red2 = cv2.inRange(hsv, (170,120,70), (180,255,255))
+    red_mask = red1 + red2
+
+    yellow_mask = cv2.inRange(hsv, (20,100,100), (35,255,255))
+
+    kernel = np.ones((5,5), np.uint8)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, kernel)
+
+    if cv2.countNonZero(red_mask) > 1500:
+        return "RED"
+    if cv2.countNonZero(yellow_mask) > 1500:
+        return "YELLOW"
+
+    return None
+
+# ============================================================
+# SYMBOL DETECTION (UNCHANGED)
+# ============================================================
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+orb = cv2.ORB_create(nfeatures=500)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+symbol_templates, symbol_labels = [], []
+
+def load_symbols():
+    if not os.path.exists(SYMBOL_FOLDER):
+        return
+    for file in os.listdir(SYMBOL_FOLDER):
+        if file.endswith(".png"):
+            img = cv2.imread(os.path.join(SYMBOL_FOLDER, file), 0)
+            kp, des = orb.detectAndCompute(img, None)
+            if des is not None:
+                symbol_templates.append(des)
+                symbol_labels.append(file.split(".")[0].lower())
+
+load_symbols()
+
+def detect_symbol(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kp, des = orb.detectAndCompute(gray, None)
+    if des is None:
+        return None
+
+    best_label = None
+    best_score = 0
+
+    for i, temp in enumerate(symbol_templates):
+        matches = bf.knnMatch(temp, des, k=2)
+        good = []
+        for pair in matches:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+
+        if len(good) > best_score:
+            best_score = len(good)
+            best_label = symbol_labels[i]
+
+    return best_label if best_score > 20 else None
+
+# ============================================================
+# CAMERA THREAD
+# ============================================================
+def camera_worker():
+    picam2 = Picamera2()
+    picam2.configure(
+        picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)}
+        )
+    )
+
+    picam2.start()
+
+    picam2.set_controls({
+        "AwbEnable": True,
+        "AeEnable": True,
+        "Contrast": 1.5,
+        "Saturation": 1.5
+    })
+
+    while state.running:
+        frame = picam2.capture_array()
+        frame = cv2.GaussianBlur(frame, (5,5), 0)
+        state.set_frame(frame)
+        time.sleep(0.01)
+        
+# ============================================================
+# AI THREAD
+# ============================================================
+def ai_worker():
+    while state.running:
+        frame = state.get_frame()
+        if frame is None:
+            continue
+
+        if state.cooldown > 0:
+            state.cooldown -= 1
+            continue
+
+        # PRIORITY COLOR
+        color = detect_priority_color(frame)
+        if color == "RED":
+            state.mode = "TURN_LEFT"
+            state.cooldown = 10
+            continue
+        elif color == "YELLOW":
+            state.mode = "TURN_RIGHT"
+            state.cooldown = 10
+            continue
+
+        # SYMBOL
+        label = detect_symbol(frame)
+        if label:
+            state.last_label = label
+            state.cooldown = 10
+
+            if label in ["warning", "press"]:
+                state.mode = "STOPPED"
+            elif label == "recycle":
+                state.mode = "SPINNING"
+            continue
+
+        state.mode = "FOLLOWING"
+        time.sleep(0.05)
+
+# ============================================================
+# CONTROL THREAD (PID + ROBUST LINE TRACK)
+# ============================================================
+def control_worker():
+
+    def drive(l, r):
+        l = int(np.clip(l, -100, 100))
+        r = int(np.clip(r, -100, 100))
+
+        GPIO.output(IN1, GPIO.LOW if l >= 0 else GPIO.HIGH)
+        GPIO.output(IN2, GPIO.HIGH if l >= 0 else GPIO.LOW)
+        pwmA.ChangeDutyCycle(abs(l))
+
+        GPIO.output(IN3, GPIO.LOW if r >= 0 else GPIO.HIGH)
+        GPIO.output(IN4, GPIO.HIGH if r >= 0 else GPIO.LOW)
+        pwmB.ChangeDutyCycle(abs(r))
+
+    KP = 0.7
+    KD = 1.2
+
+    last_error = 0
+    last_dir = 1
+
+    while state.running:
+
+        # SPECIAL MODES
+        if state.mode == "STOPPED":
+            drive(0, 0)
+            time.sleep(2)
+            continue
+
+        if state.mode == "SPINNING":
+            drive(40, -40)
+            time.sleep(2)
+            state.mode = "FOLLOWING"
+            continue
+
+        if state.mode == "TURN_LEFT":
+            drive(20, TURN_SPEED)
+            time.sleep(TURN_TIME)
+            state.mode = "FOLLOWING"
+            continue
+
+        if state.mode == "TURN_RIGHT":
+            drive(TURN_SPEED, 20)
+            time.sleep(TURN_TIME)
+            state.mode = "FOLLOWING"
+            continue
+
+        frame = state.get_frame()
+        if frame is None:
+            continue
+
+        roi = frame[380:460, :]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        mask = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            11, 5
+        )
+
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # focus center
+        h, w = mask.shape
+        mask[:, :int(w*0.2)] = 0
+        mask[:, int(w*0.8):] = 0
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                error = (cx / 640) - 0.5
+
+                derivative = error - last_error
+                correction = KP * error + KD * derivative
+                last_error = error
+
+                left = BASE_SPEED + correction * 100
+                right = BASE_SPEED - correction * 100
+
+                drive(left, right)
+                last_dir = 1 if error > 0 else -1
+
+        else:
+            # smoother search
+            drive(-20 * last_dir, 20 * last_dir)
+
+        time.sleep(0.02)
+        
+# ============================================================
+# MAIN
+# ============================================================
+threads = [
+    threading.Thread(target=camera_worker, daemon=True),
+    threading.Thread(target=ai_worker, daemon=True),
+    threading.Thread(target=control_worker, daemon=True),
+]
+
+for t in threads:
+    t.start()
+
+try:
+    while True:
+        frame = state.get_frame()
+        if frame is not None:
+            display = frame.copy()
+            cv2.putText(display, "MODE: " + state.mode, (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.imshow("Robot View", display)
+
+        if cv2.waitKey(1) == ord('q'):
+            break
+
+finally:
+    state.running = False
+    time.sleep(0.5)
+    GPIO.cleanup()
+    cv2.destroyAllWindows()
