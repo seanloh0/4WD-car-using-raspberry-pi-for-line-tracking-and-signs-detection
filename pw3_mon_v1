@@ -1,0 +1,210 @@
+import os
+import time
+import cv2
+import numpy as np
+import threading
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+
+# ============================================================
+# 1. HARDWARE & GPIO SETUP
+# ============================================================
+SERVO_GPIO = 12
+ENA, IN1, IN2 = 18, 17, 22
+ENB, IN3, IN4 = 13, 23, 24
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([SERVO_GPIO, IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+
+servo_pwm = GPIO.PWM(SERVO_GPIO, 50)
+pwmA = GPIO.PWM(ENA, 1000)
+pwmB = GPIO.PWM(ENB, 1000)
+servo_pwm.start(7.5)
+pwmA.start(0)
+pwmB.start(0)
+
+# Constants
+CENTER_ANGLE = 120
+BASE_SPEED = 30 
+
+# ============================================================
+# 2. SHARED STATE (Threading bridge)
+# ============================================================
+class SharedState:
+    def __init__(self):
+        self.frame = None
+        self.running = True
+        self.mode = "FOLLOWING" # FOLLOWING, STOPPED, SPINNING, TURN_LEFT, TURN_RIGHT
+        self.last_label = "None"
+        self.lock = threading.Lock()
+
+    def set_frame(self, frame):
+        with self.lock:
+            self.frame = frame
+
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+state = SharedState()
+
+# ============================================================
+# 3. DETECTION LOGIC (ORB & Arrows)
+# ============================================================
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+orb = cv2.ORB_create(nfeatures=600)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+symbol_templates, symbol_labels = [], []
+
+def load_symbols():
+    if not os.path.exists(SYMBOL_FOLDER): return
+    for file in os.listdir(SYMBOL_FOLDER):
+        if file.endswith(".png"):
+            img = cv2.imread(os.path.join(SYMBOL_FOLDER, file), 0)
+            kp, des = orb.detectAndCompute(img, None)
+            if des is not None:
+                symbol_templates.append(des)
+                symbol_labels.append(file.split(".")[0].lower())
+
+load_symbols()
+
+def get_arrow_direction(frame):
+    """ Detects arrows and returns 'LEFT' or 'RIGHT' """
+    small = cv2.resize(frame, (320, 240))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([0, 100, 50]), np.array([180, 255, 255]))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 1000: return None
+    M = cv2.moments(cnt)
+    cx = int(M["m10"]/M["m00"])
+    approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+    tip = max(approx, key=lambda p: (p[0][0]-cx)**2)[0]
+    # Reversed mapping for your specific setup:
+    return "LEFT" if (tip[0] - cx) > 0 else "RIGHT"
+
+# ============================================================
+# 4. THREAD 1: CAMERA WORKER
+# ============================================================
+def camera_worker():
+    picam2 = Picamera2()
+    picam2.configure(picam2.create_preview_configuration(main={"format": "BGR888", "size": (640, 480)}))
+    picam2.start()
+    try:
+        while state.running:
+            state.set_frame(picam2.capture_array())
+            time.sleep(0.01)
+    finally:
+        picam2.stop()
+        
+# ============================================================
+# 5. THREAD 2: AI & ARROW WORKER
+# ============================================================
+def ai_worker():
+    while state.running:
+        frame = state.get_frame()
+        if frame is None: continue
+        
+        # A. SYMBOL DETECTION (Priority 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kp, des = orb.detectAndCompute(gray, None)
+        symbol_found = False
+        
+        if des is not None:
+            for i, temp in enumerate(symbol_templates):
+                matches = bf.match(temp, des)
+                if len(matches) > 30: # Threshold
+                    label = symbol_labels[i]
+                    state.last_label = label
+                    symbol_found = True
+                    if label in ["warning", "press"]: state.mode = "STOPPED"
+                    elif label == "recycle": state.mode = "SPINNING"
+                    elif label in ["qr", "fingerprint"]: print(">>> PRINT DATA")
+                    break
+
+        # B. ARROW DETECTION (Priority 2 - Only if no symbol detected)
+        if not symbol_found:
+            arrow = get_arrow_direction(frame)
+            if arrow:
+                state.last_label = f"Arrow {arrow}"
+                state.mode = f"TURN_{arrow}"
+            else:
+                # If nothing detected, and we aren't in a middle of a spin/turn, follow line
+                if state.mode not in ["SPINNING", "TURN_LEFT", "TURN_RIGHT", "STOPPED"]:
+                    state.mode = "FOLLOWING"
+                    state.last_label = "None"
+
+        time.sleep(0.1)
+        
+# ============================================================
+# 6. THREAD 3: CONTROL & LINE WORKER
+# ============================================================
+def control_worker():
+    def drive(l, r, angle):
+        l, r = int(np.clip(l, -100, 100)), int(np.clip(r, -100, 100))
+        GPIO.output(IN1, GPIO.LOW if l >= 0 else GPIO.HIGH); GPIO.output(IN2, GPIO.HIGH if l >= 0 else GPIO.LOW)
+        pwmA.ChangeDutyCycle(abs(l))
+        GPIO.output(IN3, GPIO.LOW if r >= 0 else GPIO.HIGH); GPIO.output(IN4, GPIO.HIGH if r >= 0 else GPIO.LOW)
+        pwmB.ChangeDutyCycle(abs(r))
+        servo_pwm.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
+
+    last_dir = 1
+    while state.running:
+        if state.mode == "STOPPED":
+            drive(0, 0, CENTER_ANGLE); continue
+        
+        if state.mode == "SPINNING":
+            drive(45, -45, CENTER_ANGLE); time.sleep(1.6); state.mode = "FOLLOWING"; continue
+
+        if state.mode == "TURN_LEFT":
+            drive(25, 45, 70); time.sleep(0.8); state.mode = "FOLLOWING"; continue
+
+        if state.mode == "TURN_RIGHT":
+            drive(45, 25, 170); time.sleep(0.8); state.mode = "FOLLOWING"; continue
+
+        # DEFAULT: LINE FOLLOWING
+        frame = state.get_frame()
+        if frame is None: continue
+        
+        # Focus on ROI (Bottom half)
+        roi = cv2.cvtColor(frame[380:460, :], cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(roi, 70, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                error = (int(M["m10"]/M["m00"]) / 640) - 0.5
+                angle = np.clip(CENTER_ANGLE + (error * 85), 70, 170)
+                bias = (angle - CENTER_ANGLE) * 0.4
+                drive(BASE_SPEED + bias, BASE_SPEED - bias, angle)
+                last_dir = 1 if error > 0 else -1
+        else:
+            drive(-25 * last_dir, 25 * last_dir, CENTER_ANGLE) # Search
+        
+        time.sleep(0.02)
+
+# ============================================================
+# 7. MAIN START
+# ============================================================
+t1 = threading.Thread(target=camera_worker, daemon=True)
+t2 = threading.Thread(target=ai_worker, daemon=True)
+t3 = threading.Thread(target=control_worker, daemon=True)
+t1.start(); t2.start(); t3.start()
+
+try:
+    while True:
+        img = state.get_frame()
+        if img is not None:
+            cv2.putText(img, f"MODE: {state.mode}", (10, 30), 0, 0.7, (0, 255, 0), 2)
+            cv2.putText(img, f"DETECTION: {state.last_label}", (10, 60), 0, 0.7, (255, 255, 0), 2)
+            cv2.imshow("UNM Integrated Robot", img)
+        if cv2.waitKey(1) == ord('q'): break
+finally:
+    state.running = False
+    time.sleep(0.5)
+    GPIO.cleanup()
+    cv2.destroyAllWindows()
