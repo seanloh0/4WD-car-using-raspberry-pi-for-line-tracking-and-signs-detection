@@ -1,0 +1,272 @@
+import time
+import cv2
+import numpy as np
+import os
+import threading
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+ 
+# ============================================================
+# GPIO SETUP
+# ============================================================
+ENA, IN1, IN2 = 18, 17, 22
+ENB, IN3, IN4 = 13, 23, 24
+ 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+ 
+pwmA = GPIO.PWM(ENA, 1000)
+pwmB = GPIO.PWM(ENB, 1000)
+pwmA.start(0)
+pwmB.start(0)
+ 
+BASE_SPEED = 30
+
+# ============================================================
+# SHARED STATE
+# ============================================================
+class SharedState:
+    def __init__(self):
+        self.frame = None
+        self.running = True
+        self.mode = "FOLLOWING"
+        self.last_label = "None"
+        self.lock = threading.Lock()
+        self.anticipate = False
+        self.anticipate_counter = 0
+ 
+    def set_frame(self, frame):
+        with self.lock:
+            self.frame = frame
+ 
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+ 
+state = SharedState()
+ 
+# ============================================================
+# SYMBOL DETECTION
+# ============================================================
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+orb = cv2.ORB_create(nfeatures=500)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+symbol_templates, symbol_labels = [], []
+ 
+def load_symbols():
+    if not os.path.exists(SYMBOL_FOLDER): return
+    for file in os.listdir(SYMBOL_FOLDER):
+        if file.endswith(".png"):
+            img = cv2.imread(os.path.join(SYMBOL_FOLDER, file), 0)
+            if img is not None:
+                img = cv2.resize(img, (160, 120)) # Resize templates to match scale
+                kp, des = orb.detectAndCompute(img, None)
+                if des is not None:
+                    symbol_templates.append(des)
+                    symbol_labels.append(file.split(".")[0].lower())
+ 
+load_symbols()
+last_detected, stable_count, STABLE_REQUIRED = None, 0, 3
+ 
+def detect_symbol(frame):
+    global last_detected, stable_count
+    h, w = frame.shape[:2]
+    roi = frame[0:int(h * 0.5), :] # Top half
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold reduced from 500 to 150 for lower resolution
+    if cv2.countNonZero(cv2.Canny(gray, 80, 150)) < 150: return None
+ 
+    kp, des = orb.detectAndCompute(gray, None)
+    if des is None: return None
+ 
+    best_label, best_score = None, 0
+    for i, temp in enumerate(symbol_templates):
+        matches = bf.knnMatch(temp, des, k=2)
+        good = [m for pair in matches if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance]
+        if len(good) > best_score:
+            best_score = len(good)
+            best_label = symbol_labels[i]
+ 
+    if best_score < 12: return None # Reduced from 20 for 240p scale
+ 
+    if best_label == last_detected: stable_count += 1
+    else: stable_count, last_detected = 1, best_label
+ 
+    return best_label if stable_count >= STABLE_REQUIRED else None
+
+# ============================================================
+# ARROW DETECTION (RECALIBRATED FOR 320x240)
+# ============================================================
+def get_arrow_direction(frame):
+    h, w = frame.shape[:2]
+    # Focused ROI for smaller resolution
+    roi = frame[int(h*0.1):int(h*0.7), :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+ 
+    # Combined Masks
+    masks = [
+        cv2.inRange(hsv, (0,120,70), (10,255,255)),     # Red
+        cv2.inRange(hsv, (170,120,70), (180,255,255)),   # Red Wrap
+        cv2.inRange(hsv, (100,150,50), (140,255,255)),   # Blue
+        cv2.inRange(hsv, (40,70,70), (80,255,255)),      # Green
+        cv2.inRange(hsv, (20,100,100), (35,255,255))     # Yellow
+    ]
+    mask = sum(masks)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours: return None
+ 
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 200 or area > 4000: continue # Adjusted for 240p
+ 
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect_ratio = float(bw) / bh
+        extent = float(area) / (bw * bh)
+ 
+        if (0.6 < aspect_ratio < 3.5) and (extent > 0.45):
+            # Reduced edge check for smaller height
+            if y > 1 and (y + bh) < 165:
+                M = cv2.moments(cnt)
+                if M["m00"] == 0: continue
+                cx = int(M["m10"] / M["m00"])
+                approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+                tip = max(approx, key=lambda p: (p[0][0] - cx)**2)[0]
+                return "LEFT" if (tip[0] - cx) < 0 else "RIGHT"
+    return None
+
+# ============================================================
+# CAMERA THREAD (PI 4 TURBO: 320x240 @ 60FPS)
+# ============================================================
+def camera_worker():
+    picam2 = Picamera2()
+    # Using Video Configuration for higher throughput
+    config = picam2.create_video_configuration(
+        main={"format": "BGR888", "size": (320, 240)}
+    )
+    picam2.configure(config)
+    picam2.start()
+    picam2.set_controls({"FrameRate": 60})
+ 
+    try:
+        while state.running:
+            # Removed the extra cvtColor call to save CPU
+            frame = picam2.capture_array()
+            state.set_frame(frame)
+            time.sleep(0.001) # Ultra-low sleep for max FPS
+    finally:
+        picam2.stop()
+ 
+# ============================================================
+# AI THREAD
+# ============================================================
+def ai_worker():
+    while state.running:
+        frame = state.get_frame()
+        if frame is None: continue
+ 
+        # Anticipation (Density recalibrated for fewer pixels)
+        top_roi = cv2.cvtColor(frame[0:60, :], cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(top_roi, 80, 150)
+        # Reduced density threshold from 700 to 180
+        state.anticipate_counter = (state.anticipate_counter + 1) if cv2.countNonZero(edges) > 180 else max(0, state.anticipate_counter - 1)
+        state.anticipate = state.anticipate_counter >= 2
+ 
+        label = detect_symbol(frame)
+        if label:
+            state.last_label = label
+            state.anticipate_counter = 0
+            if label in ["warning", "press"]: state.mode = "STOPPED"
+            elif label == "recycle": state.mode = "SPINNING"
+        else:
+            arrow = get_arrow_direction(frame)
+            if arrow:
+                state.last_label = "Arrow " + arrow
+                state.mode = "TURN_" + arrow
+            elif state.mode not in ["SPINNING", "TURN_LEFT", "TURN_RIGHT", "STOPPED"]:
+                state.mode = "FOLLOWING"
+                state.last_label = "None"
+        time.sleep(0.05) # Faster logic loop
+ 
+# ============================================================
+# CONTROL THREAD (PID UPDATED FOR 320 WIDTH)
+# ============================================================
+def control_worker():
+    def drive(l, r):
+        l, r = int(np.clip(l, -100, 100)), int(np.clip(r, -100, 100))
+        GPIO.output(IN1, GPIO.LOW if l >= 0 else GPIO.HIGH)
+        GPIO.output(IN2, GPIO.HIGH if l >= 0 else GPIO.LOW)
+        pwmA.ChangeDutyCycle(abs(l))
+        GPIO.output(IN3, GPIO.LOW if r >= 0 else GPIO.HIGH)
+        GPIO.output(IN4, GPIO.HIGH if r >= 0 else GPIO.LOW)
+        pwmB.ChangeDutyCycle(abs(r))
+ 
+    last_error, smooth_error = 0, 0
+    KP, KD, ALPHA = 0.4, 1.6, 0.5
+    last_dir, search_strength = 1, 15
+ 
+    while state.running:
+        if state.mode == "STOPPED": drive(0, 0); continue
+        if state.mode == "SPINNING":
+            drive(40, -40); time.sleep(1.6); state.mode = "FOLLOWING"; continue
+        if state.mode in ["TURN_LEFT", "TURN_RIGHT"]:
+            l_spd, r_spd = (15, 45) if state.mode == "TURN_LEFT" else (45, 15) #2 (45,20)
+            drive(l_spd, r_spd); time.sleep(0.8); state.mode = "FOLLOWING"; continue
+ 
+        frame = state.get_frame()
+        if frame is None: continue
+ 
+        # Line Following ROI: Adjusted from [380:460] to [180:230]
+        roi = cv2.cvtColor(frame[140:230, :], cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(roi, 45, 255, cv2.THRESH_BINARY_INV) #threshold 70 -> 50
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+ 
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                # IMPORTANT: Divide by 320 instead of 640
+                error = (int(M["m10"] / M["m00"]) / 320) - 0.5
+                smooth_error = ALPHA * smooth_error + (1 - ALPHA) * error
+                correction = KP * smooth_error + KD * (smooth_error - last_error)
+                last_error = smooth_error
+ 
+                target_speed = 18 if (state.anticipate and abs(smooth_error) < 0.1) else BASE_SPEED
+                base_speed = 0.7 * target_speed + 0.3 * BASE_SPEED
+                
+                # Multiplier adjusted for faster reaction at low res
+                drive(base_speed + (correction * 35), base_speed - (correction * 40)) #control multiplier 60 -> 40
+                last_dir, search_strength = (1 if smooth_error > 0 else -1), 25
+        else:
+            drive(-search_strength * last_dir, search_strength * last_dir)
+            search_strength = min(search_strength + 18, 80)
+ 
+        time.sleep(0.01)
+        
+# ============================================================
+# MAIN
+# ============================================================
+threads = [
+    threading.Thread(target=camera_worker, daemon=True),
+    threading.Thread(target=ai_worker, daemon=True),
+    threading.Thread(target=control_worker, daemon=True),
+]
+for t in threads: t.start()
+ 
+try:
+    while True:
+        frame = state.get_frame()
+        if frame is not None:
+            # Performance Note: imshow slows down the Pi 4.
+            # If the robot stutters, comment out these lines.
+            display = frame.copy()
+            cv2.putText(display, f"MODE: {state.mode}", (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+            cv2.imshow("Robot View", display)
+        if cv2.waitKey(1) == ord('q'): break
+finally:
+    state.running = False
+    time.sleep(0.5)
+    GPIO.cleanup()
+    cv2.destroyAllWindows()

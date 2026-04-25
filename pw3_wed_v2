@@ -1,0 +1,165 @@
+import time
+import cv2
+import numpy as np
+import os
+import threading
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+ 
+# ============================================================
+# GPIO SETUP
+# ============================================================
+ENA, IN1, IN2 = 18, 17, 22
+ENB, IN3, IN4 = 13, 23, 24
+ 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+ 
+pwmA = GPIO.PWM(ENA, 1000)
+pwmB = GPIO.PWM(ENB, 1000)
+pwmA.start(0)
+pwmB.start(0)
+ 
+BASE_SPEED = 35
+ 
+# ============================================================
+# CALIBRATED HSV VALUES (From your screenshots)
+# ============================================================
+# Format: (Lower_HSV), (Upper_HSV)
+H_RED = [(160, 100, 50), (180, 255, 255)]
+H_YELLOW = [(22, 100, 100), (35, 255, 255)]
+H_BLACK = [(0, 0, 0), (180, 255, 60)]
+ 
+# ============================================================
+# SHARED STATE
+# ============================================================
+class SharedState:
+ def __init__(self):
+ self.frame = None
+ self.running = True
+ self.mode = "FOLLOWING_BLACK"
+ self.lock = threading.Lock()
+ 
+ def set_frame(self, frame):
+ with self.lock:
+ self.frame = frame
+ 
+ def get_frame(self):
+ with self.lock:
+ return self.frame.copy() if self.frame is not None else None
+ 
+state = SharedState()
+ 
+# ============================================================
+# CAMERA THREAD
+# ============================================================
+def camera_worker():
+ picam2 = Picamera2()
+ picam2.configure(picam2.create_preview_configuration(
+ main={"format": "BGR888", "size": (640, 480)}
+ ))
+ picam2.start()
+ try:
+ while state.running:
+ frame = picam2.capture_array()
+ state.set_frame(frame)
+ time.sleep(0.01)
+ finally:
+ picam2.stop()
+ 
+# ============================================================
+# COLOR PRIORITY LOGIC
+# ============================================================
+def get_priority_mask(hsv_roi):
+ # Create masks for each color
+ mask_r = cv2.inRange(hsv_roi, np.array(H_RED[0]), np.array(H_RED[1]))
+ mask_y = cv2.inRange(hsv_roi, np.array(H_YELLOW[0]), np.array(H_YELLOW[1]))
+ mask_b = cv2.inRange(hsv_roi, np.array(H_BLACK[0]), np.array(H_BLACK[1]))
+ 
+ # Priority 1: Red
+ if cv2.countNonZero(mask_r) > 1000:
+ return mask_r, "RED_LINE"
+ # Priority 2: Yellow
+ elif cv2.countNonZero(mask_y) > 1000:
+ return mask_y, "YELLOW_LINE"
+ # Priority 3: Default Black
+ else:
+ return mask_b, "BLACK_LINE"
+ 
+# ============================================================
+# CONTROL THREAD (PID + COLOR SWITCH)
+# ============================================================
+def control_worker():
+ def drive(l, r):
+ l, r = int(np.clip(l, -100, 100)), int(np.clip(r, -100, 100))
+ GPIO.output(IN1, GPIO.LOW if l >= 0 else GPIO.HIGH)
+ GPIO.output(IN2, GPIO.HIGH if l >= 0 else GPIO.LOW)
+ pwmA.ChangeDutyCycle(abs(l))
+ GPIO.output(IN3, GPIO.LOW if r >= 0 else GPIO.HIGH)
+ GPIO.output(IN4, GPIO.HIGH if r >= 0 else GPIO.LOW)
+ pwmB.ChangeDutyCycle(abs(r))
+ 
+ last_error = 0
+ KP, KD = 0.7, 1.2
+ CENTER_OFFSET = 0.03 
+ 
+ while state.running:
+ frame = state.get_frame()
+ if frame is None: continue
+ 
+ # 1. Prepare ROI and HSV
+ roi = frame[380:460, :]
+ hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+ 
+ # 2. Identify which line to follow
+ mask, line_type = get_priority_mask(hsv_roi)
+ state.mode = line_type
+ 
+ # 3. Line Following Math
+ contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+ 
+ if contours:
+ c = max(contours, key=cv2.contourArea)
+ M = cv2.moments(c)
+ if M["m00"] > 0:
+ cx = int(M["m10"] / M["m00"])
+ center = frame.shape[1] / 2
+ 
+ error = ((cx - center) / frame.shape[1]) - CENTER_OFFSET
+ derivative = error - last_error
+ correction = (KP * error) + (KD * derivative)
+ last_error = error
+ 
+ drive(BASE_SPEED + correction, BASE_SPEED - correction)
+ else:
+ # Search logic if line is lost
+ drive(25, -25) 
+ 
+ time.sleep(0.02)
+ 
+# ============================================================
+# MAIN LOOP (Visualization)
+# ============================================================
+threads = [
+ threading.Thread(target=camera_worker, daemon=True),
+ threading.Thread(target=control_worker, daemon=True),
+]
+for t in threads: t.start()
+ 
+try:
+ while True:
+ frame = state.get_frame()
+ if frame is not None:
+ cv2.putText(frame, f"MODE: {state.mode}", (10, 40), 
+ cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+ cv2.imshow("Robot View", frame)
+ 
+ if cv2.waitKey(1) == ord('q'): break
+finally:
+ state.running = False
+ time.sleep(0.5)
+ drive(0, 0)
+ GPIO.cleanup()
+ cv2.destroyAllWindows()
+ 
