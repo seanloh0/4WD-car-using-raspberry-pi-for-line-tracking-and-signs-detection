@@ -1,0 +1,261 @@
+import time
+import cv2
+import numpy as np
+import os
+import threading
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+ 
+# ============================================================
+# GPIO SETUP
+# ============================================================
+ENA, IN1, IN2 = 18, 17, 22
+ENB, IN3, IN4 = 13, 23, 24
+ 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+ 
+pwmA = GPIO.PWM(ENA, 1000)
+pwmB = GPIO.PWM(ENB, 1000)
+pwmA.start(0)
+pwmB.start(0)
+ 
+BASE_SPEED = 32 
+ 
+# ============================================================
+# SHARED STATE
+# ============================================================
+class SharedState:
+    def __init__(self):
+        self.frame = None
+        self.running = True
+        self.mode = "FOLLOWING"
+        self.last_label = "None"
+        self.lock = threading.Lock()
+        self.anticipate = False
+        self.anticipate_counter = 0
+ 
+    def set_frame(self, frame):
+        with self.lock:
+            self.frame = frame
+ 
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+ 
+state = SharedState()
+ 
+# ============================================================
+# SYMBOL & ARROW DETECTION
+# ============================================================
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+orb = cv2.ORB_create(nfeatures=500)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+symbol_templates, symbol_labels = [], []
+ 
+def load_symbols():
+    if not os.path.exists(SYMBOL_FOLDER):
+        print(f"Warning: Symbol folder {SYMBOL_FOLDER} not found.")
+        return
+    for file in os.listdir(SYMBOL_FOLDER):
+        if file.endswith(".png"):
+            img = cv2.imread(os.path.join(SYMBOL_FOLDER, file), 0)
+            if img is None: continue
+            kp, des = orb.detectAndCompute(img, None)
+            if des is not None:
+                symbol_templates.append(des)
+                symbol_labels.append(file.split(".")[0].lower())
+ 
+load_symbols()
+ 
+last_detected = None
+stable_count = 0
+STABLE_REQUIRED = 2
+ 
+def detect_symbol(frame):
+    global last_detected, stable_count
+    h, w = frame.shape[:2]
+    roi = frame[0:int(h * 0.5), :]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+    kp, des = orb.detectAndCompute(gray, None)
+    if des is None: return None
+ 
+    best_label, best_score = None, 0
+    for i, temp in enumerate(symbol_templates):
+        matches = bf.knnMatch(temp, des, k=2)
+        
+        good = []
+        for pair in matches:
+            # FIX: Only unpack if we found 2 neighbors (prevents ValueError)
+            if len(pair) == 2:
+                m, n = pair
+                if m.distance < 0.75 * n.distance:
+                    good.append(m)
+        
+        if len(good) > best_score:
+            best_score = len(good)
+            best_label = symbol_labels[i]
+ 
+    if best_score < 20: return None
+ 
+    if best_label == last_detected:
+        stable_count += 1
+    else:
+        stable_count = 1
+        last_detected = best_label
+ 
+    return best_label if stable_count >= STABLE_REQUIRED else None
+ 
+def get_arrow_direction(frame):
+    small = cv2.resize(frame, (320, 240))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    
+    # Range masks for Arrow Colors
+    m1 = cv2.inRange(hsv, (0,120,70), (10,255,255))
+    m2 = cv2.inRange(hsv, (100,150,50), (140,255,255))
+    mask = cv2.bitwise_or(m1, m2)
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 800: return None
+ 
+    M = cv2.moments(cnt)
+    if M["m00"] == 0: return None
+    cx = int(M["m10"] / M["m00"])
+    
+    approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+    tip = max(approx, key=lambda p: (p[0][0] - cx)**2)[0]
+    return "LEFT" if (tip[0] - cx) < 0 else "RIGHT"
+ 
+# ============================================================
+# THREAD WORKERS
+# ============================================================
+ 
+def camera_worker():
+    picam2 = Picamera2()
+    picam2.configure(picam2.create_preview_configuration(main={"format": "BGR888", "size": (640, 480)}))
+    picam2.start()
+    try:
+        while state.running:
+            state.set_frame(picam2.capture_array())
+            time.sleep(0.01)
+    finally:
+        picam2.stop()
+ 
+def ai_worker():
+    while state.running:
+        frame = state.get_frame()
+        if frame is None: continue
+ 
+        # Anticipation (Dense edges mean slow down)
+        top_roi = frame[0:120, :]
+        gray_top = cv2.cvtColor(top_roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray_top, 100, 200) # Increased thresholds for better stability
+        state.anticipate = cv2.countNonZero(edges) > 700
+ 
+        label = detect_symbol(frame)
+        if label:
+            state.last_label = label
+            if label in ["warning", "press"]: state.mode = "STOPPED"
+            elif label == "recycle": state.mode = "SPINNING"
+        else:
+            arrow = get_arrow_direction(frame)
+            if arrow:
+                state.last_label = "Arrow " + arrow
+                state.mode = "TURN_" + arrow
+            else:
+                state.mode = "FOLLOWING"
+                state.last_label = "None"
+        time.sleep(0.08)
+ 
+def control_worker():
+    def drive(l, r):
+        l, r = int(np.clip(l, -100, 100)), int(np.clip(r, -100, 100))
+        GPIO.output(IN1, GPIO.LOW if l >= 0 else GPIO.HIGH)
+        GPIO.output(IN2, GPIO.HIGH if l >= 0 else GPIO.LOW)
+        pwmA.ChangeDutyCycle(abs(l))
+        GPIO.output(IN3, GPIO.LOW if r >= 0 else GPIO.HIGH)
+        GPIO.output(IN4, GPIO.HIGH if r >= 0 else GPIO.LOW)
+        pwmB.ChangeDutyCycle(abs(r))
+ 
+    last_error, smooth_error = 0, 0
+    KP, KD, ALPHA = 0.8, 1.2, 0.7
+    CENTER_OFFSET = 0.05
+    last_dir, search_strength = 1, 28
+ 
+    while state.running:
+        curr_mode = state.mode
+        
+        if curr_mode == "STOPPED":
+            drive(0, 0)
+            time.sleep(0.1); continue
+        elif curr_mode == "SPINNING":
+            drive(35, -35)
+            time.sleep(0.02); continue
+        elif "TURN_" in curr_mode:
+            bias = 35 if "RIGHT" in curr_mode else -35
+            drive(BASE_SPEED + bias, BASE_SPEED - bias)
+            time.sleep(0.05); continue
+ 
+        # Line Following Logic
+        frame = state.get_frame()
+        if frame is None: continue
+ 
+        roi_img = cv2.cvtColor(frame[380:460, :], cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(roi_img, 70, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+ 
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                error = ((cx - (frame.shape[1]/2)) / frame.shape[1]) - CENTER_OFFSET
+                smooth_error = ALPHA * smooth_error + (1 - ALPHA) * error
+                
+                # PID Correction scaled to PWM range
+                correction = (KP * smooth_error + KD * (smooth_error - last_error)) * 100
+                last_error = smooth_error
+                
+                speed = 20 if (state.anticipate and abs(smooth_error) < 0.1) else BASE_SPEED
+                drive(speed + correction, speed - correction)
+                
+                last_dir = 1 if smooth_error > 0 else -1
+                search_strength = 28
+        else:
+            # Recovery: Spin back toward the last known line position
+            drive(-search_strength * last_dir, search_strength * last_dir)
+            search_strength = min(search_strength + 1, 45)
+            
+        time.sleep(0.02)
+ 
+# ============================================================
+# MAIN LOOP
+# ============================================================
+threads = [
+    threading.Thread(target=camera_worker, daemon=True),
+    threading.Thread(target=ai_worker, daemon=True),
+    threading.Thread(target=control_worker, daemon=True),
+]
+for t in threads: t.start()
+ 
+try:
+    while True:
+        f = state.get_frame()
+        if f is not None:
+            cv2.putText(f, f"MODE: {state.mode}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(f, f"DET: {state.last_label}", (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+            cv2.imshow("Robot View", f)
+        if cv2.waitKey(1) == ord('q'): break
+finally:
+    state.running = False
+    time.sleep(0.5)
+    # Stop motors physically
+    pwmA.ChangeDutyCycle(0)
+    pwmB.ChangeDutyCycle(0)
+    GPIO.cleanup()
+    cv2.destroyAllWindows()
+ 
