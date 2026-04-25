@@ -1,0 +1,345 @@
+import time
+import cv2
+import numpy as np
+import os
+import threading
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+ 
+# ============================================================
+# GPIO SETUP
+# ============================================================
+ 
+ENA, IN1, IN2 = 18, 17, 22
+ENB, IN3, IN4 = 13, 23, 24
+ 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([IN1, IN2, IN3, IN4, ENA, ENB], GPIO.OUT)
+ 
+pwmA = GPIO.PWM(ENA, 1000)
+pwmB = GPIO.PWM(ENB, 1000)
+ 
+pwmA.start(0)
+pwmB.start(0)
+ 
+BASE_SPEED = 32 #35 -> 30
+ 
+# ============================================================
+# SHARED STATE
+# ============================================================
+ 
+class SharedState:
+    def __init__(self):
+        self.frame = None
+        self.running = True
+        self.mode = "FOLLOWING"
+        self.last_label = "None"
+        self.lock = threading.Lock()
+ 
+        # Anticipation
+        self.anticipate = False
+        self.anticipate_counter = 0
+ 
+    def set_frame(self, frame):
+        with self.lock:
+            self.frame = frame
+ 
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+ 
+state = SharedState()
+
+# ============================================================
+# SYMBOL DETECTION
+# ============================================================
+ 
+SYMBOL_FOLDER = "/home/pi/Desktop/symbol"
+ 
+orb = cv2.ORB_create(nfeatures=500)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+ 
+symbol_templates, symbol_labels = [], []
+ 
+def load_symbols():
+    if not os.path.exists(SYMBOL_FOLDER):
+        return
+    for file in os.listdir(SYMBOL_FOLDER):
+        if file.endswith(".png"):
+            img = cv2.imread(os.path.join(SYMBOL_FOLDER, file), 0)
+            kp, des = orb.detectAndCompute(img, None)
+            if des is not None:
+                symbol_templates.append(des)
+                symbol_labels.append(file.split(".")[0].lower())
+ 
+load_symbols()
+ 
+last_detected = None
+stable_count = 0
+STABLE_REQUIRED = 3
+ 
+def detect_symbol(frame):
+    global last_detected, stable_count
+ 
+    h, w = frame.shape[:2]
+    roi = frame[0:int(h * 0.5), :]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+ 
+    edges = cv2.Canny(gray, 80, 150)
+    if cv2.countNonZero(edges) < 500:
+        return None
+ 
+    kp, des = orb.detectAndCompute(gray, None)
+    if des is None:
+        return None
+ 
+    best_label = None
+    best_score = 0
+ 
+    for i, temp in enumerate(symbol_templates):
+        matches = bf.knnMatch(temp, des, k=2)
+ 
+        good = []
+        for pair in matches:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+ 
+        if len(good) > best_score:
+            best_score = len(good)
+            best_label = symbol_labels[i]
+ 
+    if best_score < 20:
+        return None
+ 
+    if best_label == last_detected:
+        stable_count += 1
+    else:
+        stable_count = 1
+        last_detected = best_label
+ 
+    if stable_count >= STABLE_REQUIRED:
+        return best_label
+ 
+    return None
+
+# ============================================================
+# ARROW DETECTION
+# ============================================================
+ 
+def get_arrow_direction(frame):
+    small = cv2.resize(frame, (320, 240))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+ 
+    masks = [
+        cv2.inRange(hsv, (0,120,70), (10,255,255)),
+        cv2.inRange(hsv, (170,120,70), (180,255,255)),
+        cv2.inRange(hsv, (100,150,50), (140,255,255)),
+        cv2.inRange(hsv, (40,70,70), (80,255,255)),
+        cv2.inRange(hsv, (20,100,100), (35,255,255))
+    ]
+ 
+    mask = sum(masks)
+ 
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+ 
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 1000:
+        return None
+ 
+    M = cv2.moments(cnt)
+    if M["m00"] == 0:
+        return None
+ 
+    cx = int(M["m10"] / M["m00"])
+ 
+    approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+    tip = max(approx, key=lambda p: (p[0][0] - cx)**2)[0]
+ 
+    return "LEFT" if (tip[0] - cx) > 0 else "RIGHT"
+ 
+# ============================================================
+# CAMERA THREAD
+# ============================================================
+ 
+def camera_worker():
+    picam2 = Picamera2()
+    picam2.configure(
+        picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)}
+        )
+    )
+    picam2.start()
+ 
+    try:
+        while state.running:
+            frame = picam2.capture_array()
+            state.set_frame(frame)
+            time.sleep(0.01)
+    finally:
+        picam2.stop()
+ 
+ # ============================================================
+# AI THREAD
+# ============================================================
+ 
+def ai_worker():
+    while state.running:
+        frame = state.get_frame()
+        if frame is None:
+            continue
+ 
+        # Anticipation (multi-frame)
+        top_roi = frame[0:120, :]
+        gray = cv2.cvtColor(top_roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 80, 150)
+ 
+        edge_density = cv2.countNonZero(edges)
+ 
+        if edge_density > 700:
+            state.anticipate_counter += 1
+        else:
+            state.anticipate_counter = max(0, state.anticipate_counter - 1)
+ 
+        state.anticipate = state.anticipate_counter >= 2
+ 
+        label = detect_symbol(frame)
+ 
+        if label:
+            state.last_label = label
+            state.anticipate_counter = 0
+ 
+            if label in ["warning", "press"]:
+                state.mode = "STOPPED"
+            elif label == "recycle":
+                state.mode = "SPINNING"
+        else:
+            arrow = get_arrow_direction(frame)
+            if arrow:
+                state.last_label = "Arrow " + arrow
+                state.mode = "TURN_" + arrow
+            else:
+                state.mode = "FOLLOWING"
+                state.last_label = "None"
+ 
+        time.sleep(0.08)
+ 
+# ============================================================
+# CONTROL THREAD (CENTER FIX + SMOOTH)
+# ============================================================
+ 
+def control_worker():
+ 
+    def drive(l, r):
+        l = int(np.clip(l, -100, 100))
+        r = int(np.clip(r, -100, 100))
+ 
+        GPIO.output(IN1, GPIO.LOW if l >= 0 else GPIO.HIGH)
+        GPIO.output(IN2, GPIO.HIGH if l >= 0 else GPIO.LOW)
+        pwmA.ChangeDutyCycle(abs(l))
+ 
+        GPIO.output(IN3, GPIO.LOW if r >= 0 else GPIO.HIGH)
+        GPIO.output(IN4, GPIO.HIGH if r >= 0 else GPIO.LOW)
+        pwmB.ChangeDutyCycle(abs(r))
+ 
+    last_error = 0
+    smooth_error = 0
+ 
+    KP = 0.5
+    KD = 1.2
+    ALPHA = 0.7
+ 
+    CENTER_OFFSET =  0.05  #0.03 ->0.05
+ 
+    last_dir = 5 #1 -> 5
+    search_strength = 28 #25 -> 28
+ 
+    while state.running:
+ 
+        frame = state.get_frame()
+        if frame is None:
+            continue
+ 
+        roi = cv2.cvtColor(frame[380:460, :], cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(roi, 70, 255, cv2.THRESH_BINARY_INV)
+ 
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+ 
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            M = cv2.moments(c)
+ 
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                center = frame.shape[1] / 2
+ 
+                error = (cx - center) / frame.shape[1]
+                error -= CENTER_OFFSET   # ?? FIX
+ 
+                smooth_error = ALPHA * smooth_error + (1 - ALPHA) * error
+ 
+                derivative = smooth_error - last_error
+                correction = KP * smooth_error + KD * derivative
+                last_error = smooth_error
+ 
+                # anticipation speed
+                if state.anticipate and abs(smooth_error) < 0.1:
+                    target_speed = 18
+                else:
+                    target_speed = BASE_SPEED
+ 
+                base_speed = 0.6 * target_speed + 0.3 * BASE_SPEED 
+ 
+                left_speed = base_speed + correction
+                right_speed = base_speed - correction
+ 
+                drive(left_speed, right_speed)
+ 
+                last_dir = 1 if smooth_error > 0 else -1
+                search_strength = 25
+ 
+        else:
+            drive(-search_strength * last_dir, search_strength * last_dir)
+            search_strength = min(search_strength + 2, 60)
+ 
+        time.sleep(0.02)
+        
+# ============================================================
+# MAIN
+# ============================================================
+ 
+threads = [
+    threading.Thread(target=camera_worker, daemon=True),
+    threading.Thread(target=ai_worker, daemon=True),
+    threading.Thread(target=control_worker, daemon=True),
+]
+ 
+for t in threads:
+    t.start()
+ 
+try:
+    while True:
+        frame = state.get_frame()
+        if frame is not None:
+            display = frame.copy()
+ 
+            cv2.putText(display, "MODE: " + state.mode, (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            cv2.putText(display, "DETECTION: " + state.last_label, (10,60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+ 
+            cv2.imshow("Robot View", display)
+ 
+        if cv2.waitKey(1) == ord('q'):
+            break
+ 
+finally:
+    state.running = False
+    time.sleep(0.5)
+    GPIO.cleanup()
+    cv2.destroyAllWindows()
